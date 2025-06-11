@@ -109,8 +109,6 @@ sudo cp contrib/asngecko-completion.bash /etc/bash_completion.d/
 
 ---
 
----
-
 ## 📜 License
 
 Licensed under the MIT License – see [LICENSE](LICENSE) for details.
