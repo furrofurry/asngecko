@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+#  asngecko – Swiss-army script for fetching IPv4 / IPv6 prefixes for ASNs
+# -----------------------------------------------------------------------------
+#  Author:  <your-name>
+#  License: MIT
+# -----------------------------------------------------------------------------
+#  FEATURES
+#    • Accept single/multiple ASNs (-a) or a file (-l)
+#    • IPv4-only (-4), IPv6-only (-6) or both (default)
+#    • Custom WHOIS servers – global (-s) or per family (--server4 / --server6)
+#    • Output to console (default) or file(s):
+#         -o FILE         → FILE.ipv4 / FILE.ipv6   (when both families)
+#         --output4 FILE  → explicit IPv4 path
+#         --output6 FILE  → explicit IPv6 path
+#    • Formats: CIDR (default), CSV, JSON
+#    • De-duplicate / sort (-u)
+#    • Throttle between WHOIS look-ups (-t SEC)
+#    • Quiet mode (-q) for cron/CI
+# -----------------------------------------------------------------------------
+set -euo pipefail
+
+SCRIPT_NAME="${0##*/}"
+VERSION="1.2.0"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Defaults
+WHOIS_SERVER_V4="whois.radb.net"
+WHOIS_SERVER_V6="whois.ripe.net"
+IP_VERSION="both"           # 4 | 6 | both
+OUTPUT_DEST="console"       # console | file
+OUTPUT_FILE_BASE=""         # base name without family suffix
+OUTPUT_FILE_V4=""           # explicit IPv4 file path (optional)
+OUTPUT_FILE_V6=""           # explicit IPv6 file path (optional)
+OUTPUT_FORMAT="cidr"        # cidr | csv | json
+UNIQ=false
+QUIET=false
+THROTTLE=0
+ASN_INPUT=()
+ASN_FILE=""
+
+# ────────────────────────────────────────────────────────────────────────────────
+print_msg() { $QUIET || echo "$*" >&2; }
+
+usage() {
+  cat << EOF
+$SCRIPT_NAME $VERSION – fetch IP ranges for Autonomous Systems
+
+Usage:
+  $SCRIPT_NAME -a AS15169 [options]
+  $SCRIPT_NAME -a "AS15169 AS16509" [options]
+  $SCRIPT_NAME -a AS15169 -q [more options] | your-special-command
+  $SCRIPT_NAME -l list.txt [options]
+
+Options:
+  -a, --asn "AS… AS…"      Space-separated ASNs (quote the list)
+  -l, --list FILE          File with ASNs, one per line
+  -4                       IPv4 only
+  -6                       IPv6 only
+  -b, --both               Both families (default)
+  -s, --server HOST        WHOIS server for both families
+      --server4 HOST       WHOIS server for IPv4 (default $WHOIS_SERVER_V4)
+      --server6 HOST       WHOIS server for IPv6 (default $WHOIS_SERVER_V6)
+
+  -o, --output FILE        Base file name (adds .ipv4 / .ipv6 if needed)
+      --output4 FILE       Explicit IPv4 output path (overrides -o)
+      --output6 FILE       Explicit IPv6 output path (overrides -o)
+  -c, --console            Print to stdout (default when no -o/--outputX)
+
+  -f, --format FMT         cidr|csv|json   (default: cidr)
+
+  -u, --uniq               De-duplicate & sort prefixes
+  -t, --throttle SEC       Sleep SEC between ASN queries
+  -q, --quiet              Suppress progress output
+  -h, --help               Show this help & exit
+
+Examples:
+  $SCRIPT_NAME -a AS1234 | grep 120.0.0.0/24
+
+  # Google IPv6 to file
+  $SCRIPT_NAME -a AS15169 -6 -o google_v6.txt
+
+  # Separate destinations in one call
+  $SCRIPT_NAME -a "AS15169 AS32934" -46 \\
+               --output4 /srv/v4/all.txt \\
+               --output6 /srv/v6/all.txt
+EOF
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Parse options (GNU getopt for long opts)
+PARSED=$(getopt \
+  -o "a:l:46bs:o:cf:uqht:" \
+  --long "asn:,list:,both,server:,server4:,server6:,output:,output4:,output6:,console,format:,uniq,quiet,help,throttle:" \
+  -- "$@") || { usage; exit 1; }
+eval set -- "$PARSED"
+
+while true; do
+  case "$1" in
+    -a|--asn)         ASN_INPUT+=($2); shift 2 ;;
+    -l|--list)        ASN_FILE="$2"; shift 2 ;;
+    -4)               IP_VERSION="4"; shift ;;
+    -6)               IP_VERSION="6"; shift ;;
+    -b|--both)        IP_VERSION="both"; shift ;;
+    -s|--server)      WHOIS_SERVER_V4="$2"; WHOIS_SERVER_V6="$2"; shift 2 ;;
+    --server4)        WHOIS_SERVER_V4="$2"; shift 2 ;;
+    --server6)        WHOIS_SERVER_V6="$2"; shift 2 ;;
+
+    -o|--output)      OUTPUT_DEST="file"; OUTPUT_FILE_BASE="$2"; shift 2 ;;
+    --output4)        OUTPUT_DEST="file"; OUTPUT_FILE_V4="$2"; shift 2 ;;
+    --output6)        OUTPUT_DEST="file"; OUTPUT_FILE_V6="$2"; shift 2 ;;
+    -c|--console)     OUTPUT_DEST="console"; shift ;;
+
+    -f|--format)      OUTPUT_FORMAT="$2"; shift 2 ;;
+
+    -u|--uniq)        UNIQ=true; shift ;;
+    -t|--throttle)    THROTTLE="$2"; shift 2 ;;
+    -q|--quiet)       QUIET=true; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    --) shift; break ;;
+    *) echo "Unknown option $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Collect ASNs
+if [[ -n "$ASN_FILE" ]]; then
+  [[ -f "$ASN_FILE" ]] || { echo "File $ASN_FILE not found." >&2; exit 1; }
+  mapfile -t FILE_ASNS < <(grep -Eo 'AS?[0-9]+' "$ASN_FILE")
+  ASN_INPUT+=("${FILE_ASNS[@]}")
+fi
+[[ ${#ASN_INPUT[@]} -gt 0 ]] || { echo "No ASNs supplied." >&2; usage; exit 1; }
+
+# Normalize
+NORMALISED=()
+for asn in "${ASN_INPUT[@]}"; do
+  [[ $asn =~ ^AS[0-9]+$ ]] && NORMALISED+=("$asn") || NORMALISED+=("AS${asn#AS}")
+done
+ASN_INPUT=("${NORMALISED[@]}")
+
+print_msg "ASNs: ${ASN_INPUT[*]}"
+print_msg "IP family: $IP_VERSION"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Fetch helpers
+fetch_prefixes() {
+  local asn="$1" fam="$2" server="$3"
+  if [[ $fam == 4 ]]; then
+    whois -h "$server" -- "-i origin $asn" |
+      grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+' || true
+  else
+    whois -h "$server" -- "-i origin $asn" |
+      awk '/route6:/ {print $2}' || true
+  fi
+}
+
+RANGES_V4=()
+RANGES_V6=()
+for asn in "${ASN_INPUT[@]}"; do
+  if [[ $IP_VERSION == 4 || $IP_VERSION == both ]]; then
+    mapfile -t tmp < <(fetch_prefixes "$asn" 4 "$WHOIS_SERVER_V4")
+    RANGES_V4+=("${tmp[@]}")
+  fi
+  if [[ $IP_VERSION == 6 || $IP_VERSION == both ]]; then
+    mapfile -t tmp < <(fetch_prefixes "$asn" 6 "$WHOIS_SERVER_V6")
+    RANGES_V6+=("${tmp[@]}")
+  fi
+  (( THROTTLE > 0 )) && sleep "$THROTTLE"
+done
+
+# De-dup / sort
+dedup_sort() { mapfile -t "$1" < <(printf '%s\n' "${!1}" | sort -u); }
+$UNIQ && { dedup_sort RANGES_V4; dedup_sort RANGES_V6; }
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Formatters
+format_cidr() { printf '%s\n' "$@"; }
+
+format_csv() {
+  local fam="$1"; shift
+  for cidr in "$@"; do
+    printf '%s,%s\n' "$cidr" "$fam"
+  done
+}
+
+format_json() {
+  jq -R -s -c 'split("\n")[:-1]' <<< "$(printf '%s\n' "$@")"
+}
+
+# Decide where to write & actually write
+write_output() {
+  local content="$1" fam="$2"
+
+  # Resolve file path when saving
+  local file=""
+  case "$fam" in
+    v4) file="$OUTPUT_FILE_V4" ;;
+    v6) file="$OUTPUT_FILE_V6" ;;
+  esac
+  if [[ -z $file && $OUTPUT_DEST == file ]]; then
+    file="$OUTPUT_FILE_BASE"
+    [[ $IP_VERSION == both ]] && file+=".$fam"
+  fi
+
+  if [[ $OUTPUT_DEST == file || -n $file ]]; then
+    echo "$content" > "$file"
+    print_msg "Saved $fam → $file"
+  else
+    echo "$content"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Emit IPv4
+if [[ $IP_VERSION == 4 || $IP_VERSION == both ]]; then
+  case $OUTPUT_FORMAT in
+    cidr) write_output "$(format_cidr  "${RANGES_V4[@]}")" v4 ;;
+    csv)  write_output "$(format_csv 4 "${RANGES_V4[@]}")" v4 ;;
+    json) write_output "$(format_json   "${RANGES_V4[@]}")" v4 ;;
+  esac
+fi
+
+# Emit IPv6
+if [[ $IP_VERSION == 6 || $IP_VERSION == both ]]; then
+  case $OUTPUT_FORMAT in
+    cidr) write_output "$(format_cidr  "${RANGES_V6[@]}")" v6 ;;
+    csv)  write_output "$(format_csv 6 "${RANGES_V6[@]}")" v6 ;;
+    json) write_output "$(format_json   "${RANGES_V6[@]}")" v6 ;;
+  esac
+fi
+
+exit 0
