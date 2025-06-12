@@ -77,7 +77,7 @@ asngecko -a "AS15169 AS32934" -46 \
 ### Arch Linux / Manjaro
 
 ```bash
-sudo pacman -S asngecko
+yay -S asngecko
 ```
 
 ### Manual
