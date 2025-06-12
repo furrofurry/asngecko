@@ -6,6 +6,7 @@
 > Quickly fetch & format IPv4/IPv6 prefix lists for one‑or‑many Autonomous Systems (ASNs).
 
 Awesome customizable tool for retrieving registered IPs attached to ASN systems, enabling easy management, listing, filtering, and automation to your needs.
+This can resolve ASNs in batch, and also supports custom timeout between requests, avoiding spam.
 
 ---
 
