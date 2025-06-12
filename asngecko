@@ -39,7 +39,6 @@ THROTTLE=0
 ASN_INPUT=()
 ASN_FILE=""
 
-# ────────────────────────────────────────────────────────────────────────────────
 print_msg() { $QUIET || echo "$*" >&2; }
 
 usage() {
@@ -49,7 +48,6 @@ $SCRIPT_NAME $VERSION – fetch IP ranges for Autonomous Systems
 Usage:
   $SCRIPT_NAME -a AS15169 [options]
   $SCRIPT_NAME -a "AS15169 AS16509" [options]
-  $SCRIPT_NAME -a AS15169 -q [more options] | your-special-command
   $SCRIPT_NAME -l list.txt [options]
 
 Options:
@@ -141,6 +139,15 @@ ASN_INPUT=("${NORMALISED[@]}")
 print_msg "ASNs: ${ASN_INPUT[*]}"
 print_msg "IP family: $IP_VERSION"
 
+# If you only gave --output4 (or only --output6), restrict to that family
+if [[ "$OUTPUT_DEST" == "file" ]]; then
+  if [[ -n "$OUTPUT_FILE_V4" && -z "$OUTPUT_FILE_V6" ]]; then
+    IP_VERSION="4"
+  elif [[ -n "$OUTPUT_FILE_V6" && -z "$OUTPUT_FILE_V4" ]]; then
+    IP_VERSION="6"
+  fi
+fi
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Fetch helpers
 fetch_prefixes() {
@@ -190,9 +197,8 @@ format_json() {
 # Decide where to write & actually write
 write_output() {
   local content="$1" fam="$2"
-
-  # Resolve file path when saving
   local file=""
+
   case "$fam" in
     v4) file="$OUTPUT_FILE_V4" ;;
     v6) file="$OUTPUT_FILE_V6" ;;
